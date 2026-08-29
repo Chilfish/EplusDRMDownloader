@@ -24,9 +24,12 @@
 
     确保项目根目录存在 `bin` 文件夹，并包含以下文件（可从 Releases 下载或手动收集）：
     *   `ffmpeg.exe` (处理混流)
-    *   `mp4decrypt.exe` (Bento4 工具集，需安装 VC++ 运行库)
+    *   `shaka-packager.exe` (Shaka Packager，实时 CENC 解密引擎)
     *   `N_m3u8DL-RE.exe` (核心下载器)
-  
+    *   `*.wvd` (Widevine 设备文件，如 `google_aosp_on_ia_emulator_14.0.0_9389cec2_4464_l3.wvd`)
+
+    > `mp4decrypt` 已被 Shaka Packager 取代，不再需要。
+
 3.  **配置参数**
 
     复制 `.env.example` 为 `.env`，并填入参数（获取方法见下文）。
@@ -34,8 +37,36 @@
 4.  **运行**
 
     ```bash
-    uv run main.py
+    uv run main.py                          # 完整流程: 提取 key → 下载
+    uv run main.py --keys-only              # 只提取 key, 跳过下载
+    uv run main.py --mode live              # 强制直播模式
     ```
+
+### CLI 用法
+
+模式从 MPD URL **自动检测**（`vod.live.eplus.jp` → VOD，`stream.live.eplus.jp` → LIVE)，也可用 `--mode vod|live` 覆盖。
+
+命令行参数**优先于 `.env`**，可临时覆盖任意配置：
+
+```bash
+uv run main.py --urlMpd=... --cookieStr=... --authUrl=... --wvdPath=./bin/xxx.wvd \
+  --outputDir=./Downloads --tempDir=./Temp --recordLimit=02:00:00 --waitTime=30
+```
+
+常用参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--keys-only` | 只提取 key（输出 JSON 与 N_m3u8DL-RE 命令），跳过下载 |
+| `--mode vod\|live` | 强制下载模式，覆盖自动检测 |
+| `--urlMpd` / `--cookieStr` / `--authUrl` / `--wvdPath` | 覆盖 `.env` 中的核心参数 |
+| `--downloader` / `--ffmpeg` / `--shakaPackager` | 覆盖二进制路径 |
+| `--outputDir` / `--tempDir` / `--logDir` | 覆盖输出/临时/日志目录 |
+| `--recordLimit` | 录制时长上限 `HH:mm:ss`（VOD 与 LIVE 均适用） |
+| `--waitTime` | 直播分片刷新间隔（秒），仅 LIVE 模式 |
+
+- **VOD 模式**：下载为 `eplus_drm_<时间戳>.mp4`（`--live-perform-as-vod` 等全部档案分片，`--mux-after-done` 生成标准 MP4）。
+- **LIVE 模式**：实时录制为持续增长的 `eplus_drm_<时间戳>.ts`，PotPlayer 可直接打开；录制结束后可自行转 MP4：`ffmpeg -i <name>.ts -c copy <name>.mp4`。
 
 ### 方式二：懒人整合包 (Release)
 
@@ -48,12 +79,12 @@
 
 ## 📥 下载与更新
 
-> **注意**：整合包内已包含所有必要的二进制依赖（FFmpeg, mp4decrypt, N_m3u8DL-RE）。
+> **注意**：整合包内已包含所有必要的二进制依赖（FFmpeg, Shaka Packager, N_m3u8DL-RE, WVD）。
 
 [📦 **点击下载**](https://github.com/Chilfish/EplusDRMDownloader/releases/latest/download/EplusDRMDownloader.7z)
 
 **⚠️ 运行前必读：**
-*   **路径问题**：解压或运行路径中**绝对不能包含非英文字符**（如中文、日文、空格），否则 `mp4decrypt` 调用会失败，导致无法解密。
+*   **路径问题**：解压或运行路径中**绝对不能包含非英文字符**（如中文、日文、空格），否则二进制工具调用会失败，导致无法解密。
 *   **环境依赖**：Windows 用户如果遇到 `VCRUNTIME140.dll` 报错，请安装 [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)。
 
 ## 🔑 参数获取指南 (DevTools)
@@ -85,7 +116,7 @@
 
 *   [**Simple_Eplus_DRM_DL**](https://github.com/AlanWanco/Simple_Eplus_DRM_DL): 本项目的原型灵感来源，感谢原作者的探索。
 *   [**N_m3u8DL-RE**](https://github.com/nilaoda/N_m3u8DL-RE): @nilaoda 开发的顶级流媒体下载器，支持实时混流。
-*   [**Bento4**](https://www.bento4.com/): 提供了高效稳定的 `mp4decrypt` 解密工具。
+*   [**Shaka Packager**](https://github.com/shaka-project/shaka-packager): Google 开源的媒体打包/解密工具，用于实时 CENC 解密。
 *   [**FFmpeg**](https://ffmpeg.org/): 音视频处理领域的工业标准。
 *   [**pywidevine**](https://github.com/devine-dl/pywidevine): 优秀的 Widevine CDM 协议实现库。
 
