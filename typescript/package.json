@@ -1,7 +1,7 @@
 {
-  "name": "eplus-drm-keys",
+  "name": "simple-eplus-drm-dl",
   "type": "module",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "private": true,
   "scripts": {
     "build": "tsc --noEmit",
