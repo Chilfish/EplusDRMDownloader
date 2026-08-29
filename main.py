@@ -53,12 +53,32 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 # ── 应用目录: 打包 exe 时取 exe 所在目录, 开发时取脚本目录 ──────
-# Nuitka onefile 下 __file__ 指向临时解压目录, 无参 load_dotenv() 会
-# 去临时目录搜 .env, 读不到 exe 旁的 .env —— 这里显式按目录加载。
+# 关键坑: Nuitka onefile 下 __file__ 指向临时解压目录, sys.executable 指向
+# 临时解压的 python.exe, 而且 sys.frozen 根本不存在 —— 三者都不是 exe 本体。
+# 因此要么用 GetModuleFileNameW 取绝对 exe 路径, 要么退回 sys.argv[0]。
 def _app_dir() -> Path:
-    if getattr(sys, "frozen", False):
+    # Nuitka 会注入 __compiled__ (模块), 其 .onefile 字段标识 onefile 模式。
+    compiled = globals().get("__compiled__")
+    if compiled is not None and getattr(compiled, "onefile", False):
+        return _exe_dir()
+    if getattr(sys, "frozen", False):  # PyInstaller 等 frozen 应用
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _exe_dir() -> Path:
+    """Nuitka onefile 下定位真实 exe 所在目录。"""
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            import ctypes
+            from ctypes import wintypes
+
+            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            ctypes.windll.kernel32.GetModuleFileNameW(None, buf, wintypes.MAX_PATH)
+            if buf.value:
+                return Path(buf.value).resolve().parent
+    # 兜底: onefile 模式下 sys.argv[0] 就是 exe 路径 (绝对或相对 cwd)。
+    return Path(sys.argv[0]).resolve().parent
 
 
 APP_DIR = _app_dir()
