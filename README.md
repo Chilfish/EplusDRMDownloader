@@ -68,6 +68,14 @@ uv run main.py --urlMpd=... --cookieStr=... --authUrl=... --wvdPath=./bin/xxx.wv
 - **VOD 模式**：下载为 `eplus_drm_<时间戳>.mp4`（`--live-perform-as-vod` 等全部档案分片，`--mux-after-done` 生成标准 MP4）。
 - **LIVE 模式**：实时录制为持续增长的 `eplus_drm_<时间戳>.ts`，PotPlayer 可直接打开；录制结束后可自行转 MP4：`ffmpeg -i <name>.ts -c copy <name>.mp4`。
 
+### 备选：TypeScript 参考实现
+
+本仓库还包含一个 **TypeScript 参考实现**（位于 [`typescript/`](./typescript/)，使用 `widevine` npm 库），`main.py` 即由其移植而来，以 TS 实现为准。两者共用项目根目录的 `bin/` 与 `.env`，路径自动锚定到项目根，从任意目录均可运行：
+
+```bash
+bun ./typescript/main.ts
+```
+
 ### 方式二：懒人整合包 (Release)
 
 无需安装 Python 环境，下载即用。
