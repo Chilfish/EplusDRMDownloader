@@ -70,19 +70,39 @@ uv run main.py --urlMpd=... --cookieStr=... --authUrl=... --wvdPath=./bin/xxx.wv
 
 ### 备选：TypeScript 参考实现
 
-本仓库还包含一个 **TypeScript 参考实现**（位于 [`typescript/`](./typescript/)，使用 `widevine` npm 库），`main.py` 即由其移植而来，以 TS 实现为准。两者共用项目根目录的 `bin/` 与 `.env`，路径自动锚定到项目根，从任意目录均可运行：
+本仓库还包含一个 **TypeScript 参考实现**（位于 [`typescript/`](./typescript/)，使用 `widevine` npm 库），`main.py` 即由其移植而来，以 TS 实现为准。**本版仅以源码方式运行（不发布 npm）**；外部二进制（N_m3u8DL-RE / ffmpeg / shaka-packager / `*.wvd`）由用户自行提供，默认指向项目根 `bin/`，可用 `.env` 或 CLI 参数覆盖路径。路径自动锚定到项目根，从任意目录均可运行：
 
 ```bash
 bun ./typescript/main.ts
 ```
 
+### 🧹 代码质量 (Lint / Typecheck)
+
+项目预置了 [ruff](https://docs.astral.sh/ruff/)（lint + format）与 [pyright](https://github.com/microsoft/pyright)（类型检查），并接入 [pre-commit](https://pre-commit.com/)，均为 `dev` 依赖组、由 `uv` 锁定版本：
+
+```bash
+uv run ruff check --fix main.py   # lint 并自动修复
+uv run ruff format main.py        # 格式化 (统一引号/排版)
+uv run pyright main.py            # 类型检查
+uv run pre-commit run --all-files # 手动跑全部钩子
+```
+
+`git commit` 时钩子会自动运行以上检查（已通过 `uv run pre-commit install` 安装）。
+
 ### 方式二：懒人整合包 (Release)
 
 无需安装 Python 环境，下载即用。
 
+Release 包解压后为**同一目录**，包含：
+
+* `EplusDRMDownloader.exe` — 主程序
+* `example.env` — 配置模板（需复制为 `.env` 并填入参数）
+* `bin/` — 运行所需的二进制（ffmpeg、shaka-packager、N_m3u8DL-RE、`*.wvd`）
+* `README.md` — 使用说明
+
 1.  下载最新版本的 Release 压缩包。
 2.  解压至**不含中文或特殊字符**的路径下。
-3.  在同级目录下创建 `.env` 配置文件并填入参数。
+3.  将 `example.env` **复制为 `.env`** 并填入参数（exe 会读取**自身所在目录**下的 `.env`）。
 4.  双击运行 `EplusDRMDownloader.exe`。
 
 ## 📥 下载与更新

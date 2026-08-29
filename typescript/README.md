@@ -2,6 +2,7 @@
 
 > 这是本项目的 **TypeScript 参考实现**（基于 `widevine` npm 库），位于仓库的 `typescript/` 目录内。
 > 仓库根目录的 `main.py` 是它的 Python 移植版本（以本 TS 实现为准）。
+> 本版**仅以源码方式运行，不发布 npm**。
 
 纯命令行工具：一键完成 Eplus DRM 直播/点播的**密钥提取**与**下载**。
 
@@ -25,7 +26,7 @@ MPD URL + Cookie + Auth URL ──► 1. 获取 Auth Token
 ## 环境要求
 
 - [Bun](https://bun.sh)
-- 依赖在仓库根目录的 `bin/` 下（与 Python 版本共享，路径相对项目根解析）：
+- 外部二进制**由用户自行提供**；默认从仓库根目录的 `bin/` 读取（与 Python 版本共享，路径相对项目根解析，可用 `.env` / CLI 参数覆盖）：
   - `N_m3u8DL-RE.exe` — 下载器
   - `ffmpeg.exe` — 转封装/合并
   - `shaka-packager.exe` — 实时 CENC 解密引擎
