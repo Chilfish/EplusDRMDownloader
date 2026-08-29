@@ -10,7 +10,51 @@ dependencies = [
     "requests>=2.32.5",
 ]
 
+[project.scripts]
+build = "scripts:build"
+lint = "scripts:lint"
+format = "scripts:format"
+typecheck = "scripts:typecheck"
+check = "scripts:check"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["scripts", "main"]
+
 [dependency-groups]
 dev = [
     "nuitka>=2.8.9",
+    "pre-commit>=4.6.2",
+    "pyright>=1.1.411",
+    "ruff>=0.16.5",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["."]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# E501 (line length) is left to the formatter; not enforced by the linter.
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.pyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+include = ["main.py"]
+# Enforce the issues that previously only showed up in the editor.
+reportUnusedExpression = "error"
+reportAttributeAccessIssue = "error"
+reportArgumentType = "error"
+
+[tool.uv]
+default-groups = ["dev"]
