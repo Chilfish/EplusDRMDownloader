@@ -11,9 +11,13 @@ Eplus DRM Downloader — CLI 完整下载管道
   uv run main.py                          # 完整流程: 提取 key → 下载
   uv run main.py --keys-only              # 只提取 key, 跳过下载
   uv run main.py --mode live              # 强制 LIVE 模式
+  uv run main.py --playerUrl=... --cookieStr=...
   uv run main.py --urlMpd=... --cookieStr=... --authUrl=...
 
-默认读取 .env 文件 (python-dotenv)。CLI 参数优先于 .env 值。
+只填 PLAYER_URL + 会话 Cookie 即可: 脚本会从播放页读取标题、MPD 地址、
+channel_id、一次性 sid 和 CloudFront 签名 Cookie。
+
+默认读取 .env 文件 (python-dotenv, 覆盖已存在的环境变量)。CLI 参数优先于 .env 值。
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TypedDict
 
@@ -84,10 +89,11 @@ def _exe_dir() -> Path:
 APP_DIR = _app_dir()
 
 # 优先读 exe/脚本旁的 .env; 找不到再退回 cwd 下的 .env
+# override=True: 让 .env 覆盖父进程里可能残留的旧 URL_MPD / COOKIE_MPD
 # load_dotenv 返回是否成功加载到某个 .env 文件, 用于给出友好提示
-env_found = load_dotenv(APP_DIR / ".env")
-if not os.getenv("URL_MPD"):
-    env_found = load_dotenv() or env_found
+env_found = load_dotenv(APP_DIR / ".env", override=True)
+if not os.getenv("URL_MPD") and not os.getenv("PLAYER_URL"):
+    env_found = load_dotenv(override=True) or env_found
 
 
 def app_path(p: str) -> Path:
@@ -109,12 +115,26 @@ LICENSE_URL = "https://lic.drmtoday.com/license-proxy-widevine/cenc/?specConform
 
 MPD_KID_RE = re.compile(r'cenc:default_KID="(?P<kid>[^"]+)"')
 MPD_BASE_RE = re.compile(r"https://(?:vod|stream)\.live\.eplus\.jp/out/v1/(?P<base>[^/]*)/")
+MPD_PATH_BASE_RE = re.compile(r"/out/v1/([^/]+)/")
+AUTH_SID_RE = re.compile(r"(?P<sep>[?&])sid=[^&]*")
+PLAYER_APP_RE = re.compile(r"var\s+app\s*=\s*(\{.*?\})\s*;\s*</script>", re.S)
+PLAYER_APP_ID_RE = re.compile(r'"app_id"\s*:\s*"([^"]+)"')
+PLAYER_ASSET_ID_RE = re.compile(r'"assetId"\s*:\s*"([^"]+)"')
+PLAYER_SESSION_RE = re.compile(r"var\s+streamSession\s*=\s*['\"]([^'\"]+)['\"]")
+PLAYER_MPD_RE = re.compile(r'var\s+channels_dash\s*=\s*\["([^"]+)"\]')
+APP_NAME_RE = re.compile(r'"app_name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+PAGE_TITLE_RE = re.compile(r"<title>([^<]*)</title>", re.I)
+# 标题里不允许出现在文件名中的字符 (Windows/macOS 通用)
+UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
 )
+
+# --verbose / DEBUG=true 时打印完整响应体
+VERBOSE = False
 
 
 class KeysResult(TypedDict):
@@ -127,6 +147,20 @@ class KeysResult(TypedDict):
     keys: list[str]
     keyContainers: list[dict[str, str]]
     selectedKey: str
+    title: str | None
+    cookieStr: str
+
+
+class PlayerSession(TypedDict, total=False):
+    """播放页解析结果 (对应 lib/eplus.ts::PlayerSession)。"""
+
+    title: str
+    sid: str
+    appId: str
+    assetId: str
+    mpdUrl: str
+    cookies: str
+    cookiesExpireAt: float
 
 
 class DownloadOpts(TypedDict):
@@ -144,6 +178,7 @@ class DownloadOpts(TypedDict):
     threadCount: int
     recordLimit: str | None
     waitTime: int | None
+    title: str | None
 
 
 # ── CLI 参数解析 (--key=value 与 --flag) ───────────────────────
@@ -177,6 +212,188 @@ def parse_cookies(cookie_str: str) -> dict[str, str]:
             k, v = item.split("=", 1)
             cookies[k] = v
     return cookies
+
+
+def serialize_cookies(cookies: dict[str, str]) -> str:
+    """把字典拼回 Cookie 头。"""
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+def merge_cookies(base: str, updates: str | None) -> str:
+    """把 updates 叠加到 base 上, 保留其余 Cookie (对应 parse-cookies.ts::mergeCookies)。"""
+    if not updates:
+        return base
+    return serialize_cookies({**parse_cookies(base), **parse_cookies(updates)})
+
+
+# ── 诊断输出 (对应 lib/eplus.ts 的 preview / maskSecrets) ───────
+SECRET_RE = re.compile(
+    r'("(?:auth_token|token|license|session_?id|user_?id)"\s*:\s*")([^"]{4})[^"]*', re.I
+)
+
+
+def preview(text: str, max_len: int | None = None) -> str:
+    """截断并打码后的响应体预览, 用于日志。"""
+    limit = max_len if max_len is not None else (4000 if VERBOSE else 600)
+    masked = SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}…", text)
+    shown = masked[:limit] + "…" if len(masked) > limit else masked
+    return f"{shown.strip()} [{len(text)} chars]"
+
+
+def _set_cookie_headers(res: requests.Response) -> list[str]:
+    """取出全部 Set-Cookie (requests 的 headers 会合并同名项, 必须走 raw)。"""
+    with contextlib.suppress(Exception):
+        values = res.raw.headers.getlist("Set-Cookie")
+        if values:
+            return list(values)
+    return [v for k, v in res.raw.headers.items() if k.lower() == "set-cookie"]
+
+
+def _http_date_to_ms(value: str | None) -> float | None:
+    if not value:
+        return None
+    with contextlib.suppress(Exception):
+        return parsedate_to_datetime(value).timestamp() * 1000
+    return None
+
+
+def _policy_info(value: str) -> tuple[str, float | None]:
+    """解码 CloudFront-Policy (base64url), 返回 (Resource, 过期毫秒时间戳)。"""
+    try:
+        # CloudFront 用 URL-safe base64 ('-'/'_'), 需先还原成标准字母表
+        normalized = value.replace("-", "+").replace("_", "/")
+        padded = normalized + "=" * (-len(normalized) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8", "replace")
+        payload = json.loads(decoded[decoded.find("{") : decoded.rfind("}") + 1])
+        statement = payload["Statement"][0]
+        epoch = statement.get("Condition", {}).get("DateLessThan", {}).get("AWS:EpochTime")
+        return statement.get("Resource", ""), (float(epoch) * 1000 if epoch else None)
+    except Exception:
+        return "", None
+
+
+def pick_cloudfront_cookies(
+    set_cookies: list[str], mpd_url: str | None
+) -> tuple[str | None, float | None]:
+    """挑出签名策略覆盖 mpd_url 的那一组 CloudFront Cookie。"""
+    base_match = MPD_PATH_BASE_RE.search(mpd_url) if mpd_url else None
+    base = base_match.group(1) if base_match else None
+
+    groups: list[dict[str, object]] = []
+    for raw in set_cookies:
+        pair = raw.split(";")[0]
+        name = pair.split("=", 1)[0]
+        if not name.startswith("CloudFront-"):
+            continue
+        exp_match = re.search(r"expires=([^;]+)", raw, re.I)
+        expires = _http_date_to_ms(exp_match.group(1)) if exp_match else None
+        if name == "CloudFront-Policy":
+            resource, policy_expiry = _policy_info(pair.split("=", 1)[1])
+            groups.append(
+                {"pairs": [pair], "resource": resource, "expires": policy_expiry or expires}
+            )
+        elif groups:
+            pairs = groups[-1]["pairs"]
+            assert isinstance(pairs, list)
+            if not any(p.startswith(f"{name}=") for p in pairs):
+                pairs.append(pair)
+
+    if not groups:
+        return None, None
+
+    chosen = next((g for g in groups if base and base in str(g["resource"])), groups[0])
+    pairs = chosen["pairs"]
+    assert isinstance(pairs, list)
+    cookies = "; ".join(pairs)
+    # 响应里轮换过的 ci_session 等也一并带上
+    others = [c.split(";")[0] for c in set_cookies if not c.startswith("CloudFront-")]
+    if others:
+        cookies += "; " + "; ".join(others)
+    expires = chosen.get("expires")
+    return cookies, expires if isinstance(expires, float) else None
+
+
+def with_sid(auth_url: str, sid: str) -> str:
+    """替换 (或追加) AUTH_URL 的 sid 参数。"""
+    if AUTH_SID_RE.search(auth_url):
+        return AUTH_SID_RE.sub(lambda m: f"{m.group('sep')}sid={sid}", auth_url)
+    sep = "&" if "?" in auth_url else "?"
+    return f"{auth_url}{sep}sid={sid}"
+
+
+def fetch_player_session(player_url: str, cookie_str: str) -> PlayerSession:
+    """
+    从播放页解析完整会话 (对应 lib/eplus.ts::fetchPlayerSession)。
+
+    一次请求即可拿到: 直播标题、一次性 streamSession(sid)、MPD 地址、
+    channel_id (drmEncryptKey.assetId) 以及约 1 小时有效期的 CloudFront 签名 Cookie。
+
+    失败时返回空字典, 调用方回退到 .env 里的值。
+    """
+    session: PlayerSession = {}
+    try:
+        res = requests.get(
+            player_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Cookie": cookie_str,
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=30,
+        )
+        html = res.text
+        log.info(f"[player] GET {player_url} → HTTP {res.status_code} · {len(html)} chars")
+
+        if m := PLAYER_SESSION_RE.search(html):
+            session["sid"] = m.group(1)
+        if m := PLAYER_APP_ID_RE.search(html):
+            session["appId"] = m.group(1)
+        if m := PLAYER_ASSET_ID_RE.search(html):
+            session["assetId"] = m.group(1)
+        if m := PLAYER_MPD_RE.search(html):
+            session["mpdUrl"] = m.group(1).replace("\\/", "/")
+
+        title: str | None = None
+        if m := PLAYER_APP_RE.search(html):
+            with contextlib.suppress(json.JSONDecodeError):
+                title = json.loads(m.group(1)).get("app_name")
+        if not title and (m := APP_NAME_RE.search(html)):
+            with contextlib.suppress(json.JSONDecodeError):
+                title = json.loads(f'"{m.group(1)}"')
+        if title:
+            session["title"] = title
+
+        signed, expires = pick_cloudfront_cookies(_set_cookie_headers(res), session.get("mpdUrl"))
+        if signed:
+            session["cookies"] = signed
+        if expires:
+            session["cookiesExpireAt"] = expires
+
+        if title:
+            log.info(f"[player] app_name: {title}")
+        else:
+            page_title = PAGE_TITLE_RE.search(html)
+            log.info(
+                f"[player] 页面里没有 app_name (页面 <title>: "
+                f"{page_title.group(1).strip() if page_title else '(none)'})"
+                " — 请检查 PLAYER_URL / Cookie"
+            )
+        if sid := session.get("sid"):
+            log.info(f"[player] streamSession: {sid[:8]}… ({len(sid)} chars)")
+        else:
+            log.info("[player] 页面里没有 streamSession — 沿用 AUTH_URL 的 sid")
+        if mpd := session.get("mpdUrl"):
+            log.info(f"[player] MPD: {mpd}")
+        if expires:
+            log.info(
+                f"[player] 签名 Cookie 有效期至 {datetime.fromtimestamp(expires / 1000):%Y-%m-%dT%H:%M:%S}"
+            )
+        else:
+            log.info("[player] 未获取到 CloudFront 签名 Cookie")
+    except Exception as e:  # noqa: BLE001 — 播放页只是可选增强
+        log.info(f"[player] 请求失败: {e} — 继续使用 .env 中的值")
+        return {}
+    return session
 
 
 # ── PSSH 构建 (对应 lib/pssh.ts) ──────────────────────────────
@@ -219,51 +436,137 @@ def extract_base(url: str) -> str | None:
     return m.group("base") if m else None
 
 
-def get_eplus_keys(url_mpd: str, cookie_str: str, auth_url: str, wvd_path: str) -> KeysResult:
+def get_eplus_keys(
+    cookie_str: str,
+    wvd_path: str,
+    url_mpd: str | None = None,
+    auth_url: str | None = None,
+    player_url: str | None = None,
+) -> KeysResult:
     """
-    完整 key 提取流程 (对应 cli.ts Step 1 + lib/eplus.ts::getEplusKeys):
-      1. 从 AUTH_URL 获取 auth_token
+    完整 key 提取流程 (对应 lib/eplus.ts::getEplusKeys):
+      0. 请求播放页 → 标题、sid、MPD 地址、channel_id、签名 Cookie
+      1. 从 AUTH_URL 获取 auth_token (用新鲜 sid)
       2. 请求 MPD → 提取 KID、base
       3. 由 KID 构建 Widevine PSSH
       4. 加载 WVD 设备, 创建 CDM 会话
       5. 生成 License Challenge → POST 到 License Server
       6. 解析 License 响应 → 提取内容密钥
-    返回与 lib/eplus.ts 相同的 JSON 结构。
+    url_mpd / auth_url 省略时由 PLAYER_URL 推导。
     """
+    # ── Step 0: 播放页 → 标题 / sid / MPD / channel_id / Cookie ─
+    player = fetch_player_session(player_url, cookie_str) if player_url else {}
+    effective_cookies = merge_cookies(cookie_str, player.get("cookies"))
+    cookies = parse_cookies(effective_cookies)
+    log.info(f"[cookie] 使用 {len(cookies)} 个 Cookie: {', '.join(cookies) or '(none)'}")
+
     headers = {
         "User-Agent": USER_AGENT,
-        "Cookie": cookie_str,
+        "Cookie": effective_cookies,
     }
 
+    if not url_mpd:
+        url_mpd = player.get("mpdUrl")
+        if url_mpd:
+            log.info("[mpd] 使用 PLAYER_URL 中的 MPD 地址")
+    if not url_mpd:
+        raise RuntimeError("没有 MPD 地址 — 请设置 URL_MPD 或 PLAYER_URL")
+
+    app_id = player.get("appId")
+    asset_id = player.get("assetId")
+    fresh_sid = player.get("sid")
+
+    derived_auth_url: str | None = None
+    if app_id and asset_id and fresh_sid:
+        derived_auth_url = (
+            f"https://live.eplus.jp/api/stream/{app_id}/get_auth_token_drm"
+            f"?channel_id={asset_id}&sid={fresh_sid}"
+        )
+    if not auth_url and derived_auth_url:
+        auth_url = derived_auth_url
+        log.info("[auth] 使用 PLAYER_URL 推导出的 AUTH_URL")
+    if not auth_url:
+        raise RuntimeError("没有 AUTH_URL — 请设置 AUTH_URL 或 PLAYER_URL")
+
+    # sid 是一次性的: 优先用播放页刚拿到的新 sid, 失败再退回 AUTH_URL 里的
+    candidates = [auth_url]
+    if fresh_sid:
+        refreshed = with_sid(auth_url, fresh_sid)
+        if refreshed != auth_url:
+            candidates.insert(0, refreshed)
+            log.info(f"[auth] 使用 PLAYER_URL 的新 sid {fresh_sid[:8]}…")
+
     # ── Step 1: 获取 auth_token ─────────────────────────────
-    auth_res = requests.get(auth_url)
-    if auth_res.status_code != 200:
-        raise RuntimeError(f"Auth token request failed: {auth_res.status_code}")
-    auth_token = auth_res.json().get("auth_token")
+    auth_token: str | None = None
+    auth_text = ""
+    auth_status = 0
+    for index, candidate in enumerate(candidates):
+        suffix = " (退回 AUTH_URL 的 sid)" if index > 0 else ""
+        log.info(f"[auth] GET {candidate}{suffix}")
+        auth_res = requests.get(candidate, headers=headers, timeout=30)
+        auth_text = auth_res.text
+        auth_status = auth_res.status_code
+        log.info(
+            f"[auth] HTTP {auth_res.status_code} · "
+            f"content-type: {auth_res.headers.get('content-type', '(none)')} · "
+            f"{len(auth_text)} chars"
+        )
+        log.info(f"[auth] body: {preview(auth_text)}")
+        if auth_res.status_code == 200:
+            with contextlib.suppress(json.JSONDecodeError):
+                auth_token = json.loads(auth_text).get("auth_token")
+            if auth_token:
+                break
+
     if not auth_token:
-        raise RuntimeError("No auth_token in auth response")
+        hint = ""
+        if '"error"' in auth_text:
+            hint = (
+                '服务端拒绝了请求 ({"error":true})。请设置 PLAYER_URL 以自动换取新 sid，'
+                "或在播放器运行时重新复制 AUTH_URL 与 Cookie。"
+            )
+            if "ci_session" not in cookies:
+                hint += (
+                    " 当前 Cookie 缺少 ci_session —— 请复制 get_auth_token_drm 请求的"
+                    " Cookie 头 (并保留 .mpd 请求里的 CloudFront-*)。"
+                )
+        raise RuntimeError(
+            f"No auth_token in auth response (HTTP {auth_status}) — body: {preview(auth_text)}\n   {hint}"
+        )
+    log.info(f"[auth] 已获取 auth_token ({len(auth_token)} chars)")
 
     # ── Step 2: 请求 MPD, 提取 KID / Base ───────────────────
-    mpd_res = requests.get(url_mpd, headers=headers)
-    if mpd_res.status_code != 200:
-        raise RuntimeError(f"MPD fetch failed: {mpd_res.status_code}")
+    log.info(f"[mpd] GET {url_mpd}")
+    mpd_res = requests.get(url_mpd, headers=headers, timeout=30)
     mpd_text = mpd_res.text
     final_url = mpd_res.url  # 重定向后的最终 URL
+    log.info(f"[mpd] HTTP {mpd_res.status_code} · {len(mpd_text)} chars · final URL: {final_url}")
+    if mpd_res.status_code != 200:
+        raise RuntimeError(f"MPD fetch failed: {mpd_res.status_code} — body: {preview(mpd_text)}")
+    if "cenc:default_KID" not in mpd_text:
+        raise RuntimeError(f"MPD contains no cenc:default_KID — head: {preview(mpd_text)}")
 
     base = extract_base(final_url)
     kid = extract_kid(mpd_text)
     if not kid:
         raise RuntimeError("Could not find cenc:default_KID in MPD")
+    log.info(f"[mpd] KID={kid} base={base or '(none)'}")
 
     # ── Step 3: 由 KID 构建 PSSH ────────────────────────────
     pssh = create_pssh_from_kid(kid)
+    log.info(f"[pssh] {len(pssh)} chars (base64)")
 
     # ── Step 4-6: Widevine CDM → License → keys ─────────────
     device = Device.load(wvd_path)
     cdm = Cdm.from_device(device)
     session_id = cdm.open()
+    log.info("[wvd] 设备已加载, CDM 会话已创建")
     try:
         challenge = cdm.get_license_challenge(session_id, PSSH(pssh))
+        log.info(
+            f"[license] POST {LICENSE_URL} · challenge {len(challenge)} bytes · "
+            f"X-Dt-Auth-Token {len(auth_token)} chars"
+        )
 
         license_res = requests.post(
             LICENSE_URL,
@@ -273,13 +576,24 @@ def get_eplus_keys(url_mpd: str, cookie_str: str, auth_url: str, wvd_path: str) 
                 "X-Dt-Auth-Token": auth_token,
             },
             data=challenge,
+            timeout=30,
+        )
+        log.info(
+            f"[license] HTTP {license_res.status_code} · "
+            f"content-type: {license_res.headers.get('content-type', '(none)')} · "
+            f"{len(license_res.content)} bytes"
         )
         if license_res.status_code != 200:
             raise RuntimeError(
-                f"License request failed [{license_res.status_code}]: {license_res.text[:500]}"
+                f"License request failed [{license_res.status_code}]: {preview(license_res.text)}"
             )
 
-        cdm.parse_license(session_id, license_res.content)
+        try:
+            cdm.parse_license(session_id, license_res.content)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to parse license response: {e} — body: {preview(license_res.text)}"
+            ) from e
         raw_keys = cdm.get_keys(session_id)
     finally:
         cdm.close(session_id)
@@ -293,6 +607,7 @@ def get_eplus_keys(url_mpd: str, cookie_str: str, auth_url: str, wvd_path: str) 
     key_containers = [{"kid": k.kid.hex, "key": k.key.hex()} for k in raw_keys]
     keys = [f"{k['kid']}:{k['key']}" for k in key_containers]
     selected = key_containers[1] if len(key_containers) > 1 else key_containers[0]
+    log.info(f"[license] keys: {', '.join(k['kid'] for k in key_containers)}")
 
     return {
         "mpdUrl": final_url,
@@ -302,6 +617,8 @@ def get_eplus_keys(url_mpd: str, cookie_str: str, auth_url: str, wvd_path: str) 
         "keys": keys,
         "keyContainers": key_containers,
         "selectedKey": f"{selected['kid']}:{selected['key']}",
+        "title": player.get("title"),
+        "cookieStr": effective_cookies,
     }
 
 
@@ -316,9 +633,21 @@ def detect_mode(url: str) -> str:
     return "vod"
 
 
-def build_common_args(opts: DownloadOpts) -> list[str]:
+def safe_file_name(name: str) -> str:
+    """把标题转成安全的文件名前缀 (对应 lib/download.ts::safeFileName)。"""
+    cleaned = re.sub(r"\s+", " ", UNSAFE_FILENAME_RE.sub("_", name)).strip().rstrip(". ")
+    return cleaned[:80] or "eplus"
+
+
+def default_save_name(opts: DownloadOpts) -> str:
+    """基础输出名: 有标题用标题, 否则 eplus_drm_<时间戳>。"""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    title = opts.get("title")
+    return f"{safe_file_name(title)}_{timestamp}" if title else f"eplus_drm_{timestamp}"
+
+
+def build_common_args(opts: DownloadOpts, save_name: str) -> list[str]:
     """两种模式共用的 N_m3u8DL-RE 参数。"""
-    save_name = f"eplus_drm_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     args = [
         opts["urlMpd"],
         "--save-name",
@@ -364,12 +693,13 @@ def run_downloader(downloader_path: str, args: list[str]) -> None:
 def download_vod(opts: DownloadOpts) -> None:
     """
     VOD (回放/存档) 下载。
-    输出: eplus_drm_<时间戳>.mp4
+    输出: <标题>_<时间戳>.mp4
 
     --live-perform-as-vod  确保所有分片收集完毕再 "done"
     --mux-after-done mp4   得到带 moov atom 的标准 MP4
     """
-    args = build_common_args(opts)
+    save_name = default_save_name(opts)
+    args = build_common_args(opts, save_name)
     args += ["--live-perform-as-vod", "--mux-after-done", "format=mp4"]
 
     record_limit = opts["recordLimit"]
@@ -380,6 +710,8 @@ def download_vod(opts: DownloadOpts) -> None:
     print("║  📼 VOD 模式 — 存档下载                               ║")
     print("╚══════════════════════════════════════════════════════╝")
     print(f"  🔗 {opts['urlMpd']}")
+    print(f"  🎬 标题:     {opts.get('title') or '(none)'}")
+    print(f"  📄 文件名:   {save_name}.mp4")
     print(f"  📁 输出目录: {Path(opts['outputDir']).resolve()}")
     print(f"  📝 日志:     {opts.get('logFilePath') or '(none)'}")
     print("  🏷️  容器:     MP4 (moov atom finalized on completion)")
@@ -395,7 +727,7 @@ def download_vod(opts: DownloadOpts) -> None:
 def download_live(opts: DownloadOpts) -> None:
     """
     LIVE (直播) 下载。
-    输出: eplus_drm_<时间戳>.ts (持续增长的 TS 文件, PotPlayer 可直接打开)
+    输出: <标题>_<时间戳>.ts (持续增长的 TS 文件, PotPlayer 可直接打开)
 
     --live-real-time-merge  实时混流
     --live-pipe-mux         解密后的分片经管道交给 ffmpeg
@@ -404,7 +736,8 @@ def download_live(opts: DownloadOpts) -> None:
 
     录制结束后转 MP4: ffmpeg -i <name>.ts -c copy <name>.mp4
     """
-    args = build_common_args(opts)
+    save_name = default_save_name(opts)
+    args = build_common_args(opts, save_name)
     args += ["--live-real-time-merge", "--live-pipe-mux", "--live-keep-segments"]
 
     record_limit = opts["recordLimit"]
@@ -418,6 +751,8 @@ def download_live(opts: DownloadOpts) -> None:
     print("║  🔴 LIVE 模式 — 实时录制                              ║")
     print("╚══════════════════════════════════════════════════════╝")
     print(f"  🔗 {opts['urlMpd']}")
+    print(f"  🎬 标题:     {opts.get('title') or '(none)'}")
+    print(f"  📄 文件名:   {save_name}.ts")
     print(f"  📁 输出目录: {Path(opts['outputDir']).resolve()}")
     print(f"  📝 日志:     {opts.get('logFilePath') or '(none)'}")
     print("  🏷️  容器:     TS (growing — PotPlayer 可直接打开)")
@@ -435,36 +770,46 @@ def download_live(opts: DownloadOpts) -> None:
 
 # ── 主入口 (对应 cli.ts::main) ────────────────────────────────
 def main() -> None:
+    global VERBOSE
+
     args = parse_args()
     keys_only = args.get("keys-only") == "true"
+    VERBOSE = args.get("verbose") == "true" or os.getenv("DEBUG") == "true"
 
     # 参数解析: CLI 参数优先, 其次 .env
     url_mpd = args.get("urlMpd") or os.getenv("URL_MPD")
     cookie_str = args.get("cookieStr") or os.getenv("COOKIE_MPD")
     auth_url = args.get("authUrl") or os.getenv("AUTH_URL")
+    player_url = args.get("playerUrl") or os.getenv("PLAYER_URL")
     wvd_path = args.get("wvdPath") or os.getenv("WVD_PATH")
 
-    # 校验必填参数 (合并判空, 便于类型收窄为 str)
-    if not (url_mpd and cookie_str and auth_url and wvd_path):
+    # 校验必填参数: url_mpd / auth_url 在有 PLAYER_URL 时可省略 (由播放页推导)
+    missing: list[str] = []
+    if not cookie_str:
+        missing.append("COOKIE_MPD (--cookieStr)")
+    if not wvd_path:
+        missing.append("WVD_PATH (--wvdPath)")
+    if not player_url and not url_mpd:
+        missing.append("PLAYER_URL (--playerUrl) 或 URL_MPD (--urlMpd)")
+    if not player_url and not auth_url:
+        missing.append("PLAYER_URL (--playerUrl) 或 AUTH_URL (--authUrl)")
+    if missing:
         print("❌ Missing required params:")
-        if not url_mpd:
-            print("   - URL_MPD (--urlMpd)")
-        if not cookie_str:
-            print("   - COOKIE_MPD (--cookieStr)")
-        if not auth_url:
-            print("   - AUTH_URL (--authUrl)")
-        if not wvd_path:
-            print("   - WVD_PATH (--wvdPath)")
+        for item in missing:
+            print(f"   - {item}")
         if not env_found:
             print("\n未找到 .env 文件：请先将 example.env 复制为 .env 并填写参数")
         print("\nSet them in .env or pass via CLI:")
-        print("  uv run main.py --urlMpd=... --cookieStr=... --authUrl=... --wvdPath=./bin/xxx.wvd")
+        print("  uv run main.py --playerUrl=... --cookieStr=... --wvdPath=./bin/xxx.wvd")
         sys.exit(1)
 
+    # 走到这里必填项都已有值, 用 assert 收窄类型供类型检查器使用
+    assert cookie_str and wvd_path
+
     # 模式检测 (--mode 可覆盖自动检测)
-    mode = args.get("mode") or detect_mode(url_mpd)
+    mode = args.get("mode") or (detect_mode(url_mpd) if url_mpd else "live")
     log.info(f"Mode: {mode.upper()}")
-    log.info(f"MPD:  {url_mpd}")
+    log.info(f"MPD:  {url_mpd or '(derived from PLAYER_URL)'}")
 
     # 下载相关参数 (默认应用目录下的 ./bin, 与原项目结构一致)
     downloader_path = (
@@ -494,15 +839,24 @@ def main() -> None:
         log.info(f"Loading WVD: {wvd_path}")
         log.info("Extracting keys...")
 
-        result = get_eplus_keys(url_mpd, cookie_str, auth_url, str(app_path(wvd_path)))
+        result = get_eplus_keys(
+            cookie_str=cookie_str,
+            wvd_path=str(app_path(wvd_path)),
+            url_mpd=url_mpd,
+            auth_url=auth_url,
+            player_url=player_url,
+        )
 
         log.info(f"KID:  {result['kid']}")
         log.info(f"Key:  {result['selectedKey']}")
         log.info(f"Base: {result.get('base') or '(none)'}")
+        log.info(f"Title: {result.get('title') or '(none)'}")
 
         if keys_only:
             print("\n── Key data ───────────────────────────────────────────")
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            # 不打印 Cookie (含会话凭证)
+            printable = {**result, "cookieStr": "(redacted)"}
+            print(json.dumps(printable, indent=2, ensure_ascii=False))
             print("\n── N_m3u8DL-RE command ───────────────────────────────")
             print(f'N_m3u8DL-RE "{result["mpdUrl"]}" --key "{result["selectedKey"]}"')
             return
@@ -515,9 +869,11 @@ def main() -> None:
         ensure_dir(temp_dir)
         ensure_dir(log_dir)
 
+        title = args.get("title") or os.getenv("TITLE") or result.get("title")
+
         base_opts: DownloadOpts = {
             "urlMpd": result["mpdUrl"],
-            "cookieStr": cookie_str,
+            "cookieStr": result["cookieStr"],
             "key": result["selectedKey"],
             "downloaderPath": str(app_path(downloader_path)),
             "ffmpegPath": str(app_path(ffmpeg_path)),
@@ -528,6 +884,7 @@ def main() -> None:
             "threadCount": 16,
             "recordLimit": record_limit,
             "waitTime": wait_time,
+            "title": title,
         }
 
         if mode == "live":
