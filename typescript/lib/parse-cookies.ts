@@ -24,3 +24,14 @@ export function serializeCookies(cookies: Record<string, string>): string {
     .map(([k, v]) => `${k}=${v}`)
     .join('; ')
 }
+
+/**
+ * Overlay `updates` onto `base`, keeping every other cookie untouched.
+ * Used to swap in freshly signed CloudFront cookies without losing the
+ * eplus session cookies.
+ */
+export function mergeCookies(base: string, updates: string | undefined): string {
+  if (!updates)
+    return base
+  return serializeCookies({ ...parseCookies(base), ...parseCookies(updates) })
+}

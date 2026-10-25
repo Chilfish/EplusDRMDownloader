@@ -64,9 +64,14 @@ uv run main.py --urlMpd=... --cookieStr=... --authUrl=... --wvdPath=./bin/xxx.wv
 | `--outputDir` / `--tempDir` / `--logDir` | 覆盖输出/临时/日志目录 |
 | `--recordLimit` | 录制时长上限 `HH:mm:ss`（VOD 与 LIVE 均适用） |
 | `--waitTime` | 直播分片刷新间隔（秒），仅 LIVE 模式 |
+| `--playerUrl` | 播放页 URL（`/ex/player?ib=...` 或 `?ep=...`）：标题 / MPD / sid / channel_id / 签名 Cookie 全部自动获取 |
+| `--title` | 直接指定输出文件名前缀（优先于 `--playerUrl`） |
+| `--verbose` | 打印完整 HTTP 响应体，便于排查鉴权问题 |
 
-- **VOD 模式**：下载为 `eplus_drm_<时间戳>.mp4`（`--live-perform-as-vod` 等全部档案分片，`--mux-after-done` 生成标准 MP4）。
-- **LIVE 模式**：实时录制为持续增长的 `eplus_drm_<时间戳>.ts`，PotPlayer 可直接打开；录制结束后可自行转 MP4：`ffmpeg -i <name>.ts -c copy <name>.mp4`。
+- **VOD 模式**：下载为 `<标题>_<时间戳>.mp4`（`--live-perform-as-vod` 等全部档案分片，`--mux-after-done` 生成标准 MP4）。
+- **LIVE 模式**：实时录制为持续增长的 `<标题>_<时间戳>.ts`，PotPlayer 可直接打开；录制结束后可自行转 MP4：`ffmpeg -i <name>.ts -c copy <name>.mp4`。
+- **文件名**：设置了 `PLAYER_URL`（或 `TITLE`）时用直播标题作前缀，标题中的 `/ \ : * ? " < > |` 会被替换为 `_`；未设置时回退为 `eplus_drm_<时间戳>`。启动时的 banner 会显示最终文件名。
+- **sid / 签名 Cookie 自动获取**：`AUTH_URL` 里的 `sid` 是一次性的；Eplus 签发的 CloudFront Cookie 有效期约 1 小时。设置 `PLAYER_URL` 后，每次运行都会先打开播放页换取新的 `sid` 与签名 Cookie，无需手动更新 `.env`。超过 1 小时的长时录制需要重新运行（Cookie 到期后分段下载会 403）。
 
 ### 备选：TypeScript 参考实现
 
@@ -117,26 +122,26 @@ Release 包解压后为**同一目录**，包含：
 
 ## 🔑 参数获取指南 (DevTools)
 
-下载回放需要三个核心参数：`MPD地址`、`Cookie`、`Auth验证URL`。
+只要拿到**播放页地址**和**会话 Cookie** 两个值，其余（MPD、Auth URL、sid、CloudFront 签名 Cookie）全部由脚本自动获取并定时刷新。
 
 请使用 Edge 或 Chrome 浏览器，按 `F12` 打开开发者工具。
 
-### 1. MPD 地址 & Cookie
+### 1. 播放页 URL → `PLAYER_URL`
 
-1.  进入 **Network (网络)** 面板，勾选 **Preserve log (保留日志)** 和 **Disable cache (禁用缓存)**。
-2.  在过滤器中输入 `mpd`。
-3.  刷新回放页面，点击列表中出现的 `.mpd` 请求。
-    *   **URL**: 右键请求 -> Copy URL -> 填入 `.env` 的 `URL_MPD`。
-    *   **Cookie**: 查看 **Headers (标头)** -> **Request Headers (请求标头)** -> 复制 `Cookie` 字段的全部内容 -> 填入 `.env` 的 `COOKIE_MPD`。
+地址栏里正在观看的地址即可，形如 `https://live.eplus.jp/ex/player?ib=...` 或 `?ep=...`。
 
-### 2. Auth 验证 URL
+> 脚本会从这个页面读取直播标题、`streamSession`、MPD 地址、`channel_id`，并拿到约 1 小时有效期的 CloudFront 签名 Cookie。
 
-1.  保持开发者工具打开，将过滤器修改为 `drm`。
-2.  点击播放器开始播放视频。
-3.  网络面板会出现 `get_auth_token_drm?...` 开头的请求。
-4.  右键复制该请求的完整 URL -> 填入 `.env` 的 `AUTH_URL`。
+### 2. 会话 Cookie → `COOKIE_MPD`
 
-> **提示**：Cookie 和 Auth Token 的有效期较短（通常约 1 小时），若下载失败（403/400 错误），请重新获取并更新 `.env`。
+1.  将过滤器修改为 `drm`，播放器开始播放后会出现 `get_auth_token_drm?...` 请求。
+2.  点击该请求 -> **Headers** -> **Request Headers** -> 复制 `Cookie` 字段 -> 填入 `.env` 的 `COOKIE_MPD`。
+
+> **只需要 `live.eplus.jp` 的会话 Cookie**（`KOJIN_SHIKIBETSU`、`ci_session` 等）。
+> 不必复制 `CloudFront-Policy` / `CloudFront-Signature` / `CloudFront-Key-Pair-Id`，它们会随 `PLAYER_URL` 自动签发并定时刷新。
+> 缺少 `ci_session` 时接口会返回 HTTP 200 + `{"error":true}`（脚本会提示这一点）。
+
+> **提示**：会话 Cookie 有效期较长；签名 Cookie 约 1 小时，长时录制会自动分段续录，无需手动更新 `.env`。
 
 ## 🤝 致谢
 

@@ -27,6 +27,8 @@ interface BaseOptions {
   outputDir: string
   tempDir: string
   threadCount?: number
+  /** Stream title used as the output file prefix */
+  title?: string
   /** Log file for N_m3u8DL-RE's own output */
   logFilePath?: string
 }
@@ -66,10 +68,29 @@ export function detectMode(url: string): 'vod' | 'live' {
   return 'vod'
 }
 
-/** Build args common to both modes */
-function buildCommonArgs(opts: BaseOptions): string[] {
+/**
+ * Make a string safe for a Windows/macOS/Linux file name: strip path
+ * separators and reserved characters, collapse whitespace, drop trailing
+ * dots/spaces and cap the length so full paths stay well under limits.
+ */
+function safeFileName(name: string): string {
+  const cleaned = name
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\\/:*?"<>|\u0000-\u001F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/, '')
+  return cleaned.slice(0, 80) || 'eplus'
+}
+
+/** Base output name (stream title + timestamp, or the eplus default). */
+function defaultSaveName(opts: BaseOptions): string {
   const ts = timestamp()
-  const saveName = `eplus_drm_${ts}`
+  return opts.title ? `${safeFileName(opts.title)}_${ts}` : `eplus_drm_${ts}`
+}
+
+/** Build args common to both modes */
+function buildCommonArgs(opts: BaseOptions, saveName: string): string[] {
   const args: string[] = [
     opts.urlMpd,
     '--save-name',
@@ -136,8 +157,9 @@ function spawn(downloaderPath: string, args: string[]): void {
  */
 export function downloadVod(options: VodOptions): void {
   const { recordLimit } = options
+  const saveName = defaultSaveName(options)
 
-  const args = buildCommonArgs(options)
+  const args = buildCommonArgs(options, saveName)
 
   // VOD-specific
   args.push('--live-perform-as-vod')
@@ -151,6 +173,8 @@ export function downloadVod(options: VodOptions): void {
   console.log('║  📼 VOD 模式 — 存档下载                               ║')
   console.log('╚══════════════════════════════════════════════════════╝')
   console.log(`  🔗 ${options.urlMpd}`)
+  console.log(`  🎬 标题:     ${options.title ?? '(none)'}`)
+  console.log(`  📄 文件名:   ${saveName}.mp4`)
   console.log(`  📁 输出目录: ${resolve(options.outputDir)}`)
   console.log(`  📝 日志:     ${options.logFilePath ?? '(none)'}`)
   console.log(`  🏷️  容器:     MP4 (moov atom finalized on completion)`)
@@ -168,7 +192,7 @@ export function downloadVod(options: VodOptions): void {
 /**
  * Download LIVE stream.
  *
- * Output: eplus_drm_<timestamp>.ts  (growing TS file)
+ * Output: <title>_<timestamp>.ts  (growing TS file)
  *
  * Flags:
  *   --live-pipe-mux         pipe decrypted segments to ffmpeg → single TS file
@@ -181,26 +205,25 @@ export function downloadVod(options: VodOptions): void {
  */
 export function downloadLive(options: LiveOptions): void {
   const { recordLimit, waitTime } = options
+  const baseName = defaultSaveName(options)
+  const args = buildCommonArgs(options, baseName)
 
-  const args = buildCommonArgs(options)
-
-  // LIVE-specific
   args.push('--live-real-time-merge')
   args.push('--live-pipe-mux')
   args.push('--live-keep-segments')
   // ⚠️ NO --mux-after-done → keeps TS output
 
-  if (recordLimit) {
+  if (recordLimit)
     args.push('--live-record-limit', recordLimit)
-  }
-  if (waitTime != null) {
+  if (waitTime != null)
     args.push('--live-wait-time', String(waitTime))
-  }
 
   console.log('╔══════════════════════════════════════════════════════╗')
   console.log('║  🔴 LIVE 模式 — 实时录制                              ║')
   console.log('╚══════════════════════════════════════════════════════╝')
   console.log(`  🔗 ${options.urlMpd}`)
+  console.log(`  🎬 标题:     ${options.title ?? '(none)'}`)
+  console.log(`  📄 文件名:   ${baseName}.ts`)
   console.log(`  📁 输出目录: ${resolve(options.outputDir)}`)
   console.log(`  📝 日志:     ${options.logFilePath ?? '(none)'}`)
   console.log(`  🏷️  容器:     TS (growing — PotPlayer 可直接打开)`)
